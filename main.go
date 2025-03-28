@@ -2,8 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 
 	_ "github.com/lib/pq"
 )
@@ -13,19 +15,19 @@ type DatabaseSource struct {
 }
 
 type DatabaseMetadata struct {
-	Tables []TableMetadata
+	Tables []TableMetadata `json:"tables"`
 }
 
 type TableMetadata struct {
-	Name       string
-	Columns    []Column
-	PrimaryKey []string
+	Name       string   `json:"name"`
+	Columns    []Column `json:"columns"`
+	PrimaryKey []string `json:"primaryKey"`
 }
 
 type Column struct {
-	Name     string
-	DataType string
-	Nullable string
+	Name     string `json:"name"`
+	DataType string `json:"dataType"`
+	Nullable string `json:"nullable"`
 }
 
 func NewDatabaseSource(connStr string) (*DatabaseSource, error) {
@@ -38,7 +40,7 @@ func NewDatabaseSource(connStr string) (*DatabaseSource, error) {
 		return nil, err
 	}
 
-	fmt.Println("Successfully connected to PostgreSQL!")
+	fmt.Println("Successfully connected")
 
 	return &DatabaseSource{DB: db}, nil
 }
@@ -157,6 +159,51 @@ func (ds *DatabaseSource) GetTableMetadata(tableName string) (*TableMetadata, er
 	return tableInfo, nil
 }
 
+func (ds *DatabaseSource) GetData(tableName string) ([]map[string]any, error) {
+	rows, err := ds.DB.Query(fmt.Sprintf("SELECT * FROM %s", tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var data []map[string]any
+	for rows.Next() {
+		columnPointers := make([]any, len(columns))
+		for i := range columnPointers {
+			columnPointers[i] = new(any)
+		}
+
+		if err := rows.Scan(columnPointers...); err != nil {
+			return nil, err
+		}
+
+		rowData := make(map[string]any)
+		for i, colName := range columns {
+			val := columnPointers[i].(*any)
+			switch v := (*val).(type) {
+			case []byte:
+				rowData[colName] = string(v)
+			case string:
+				rowData[colName] = v
+			default:
+				rowData[colName] = *val
+			}
+		}
+		data = append(data, rowData)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
 func main() {
 	connStr := "user=postgres password=postgres dbname=postgres sslmode=disable"
 	source, err := NewDatabaseSource(connStr)
@@ -171,5 +218,26 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Database Metadata:", m)
+	http.HandleFunc("GET /tables", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(m.Tables)
+	})
+
+	http.HandleFunc("GET /tables/{name}/data", func(w http.ResponseWriter, r *http.Request) {
+		tableName := r.PathValue("name")
+
+		w.Header().Set("Content-Type", "application/json")
+
+		data, err := source.GetData(tableName)
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(data)
+	})
+
+	http.ListenAndServe(":8080", nil)
+
 }
